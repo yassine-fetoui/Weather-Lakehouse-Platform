@@ -1,0 +1,159 @@
+name: CI/CD — Weather Lakehouse Platform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  TF_DIR:     terraform/environments/prod
+
+jobs:
+  # ── PR: Terraform plan ─────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Validate & Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: Terraform validate
+        run: terraform validate
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: Terraform plan
+        id: plan
+        run: terraform plan -no-color
+        working-directory: ${{ env.TF_DIR }}
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan\n\`\`\`\n${{ steps.plan.outputs.stdout }}\n\`\`\``
+            });
+
+  # ── PR: Security scan ──────────────────────────────────────────────────
+  security:
+    name: Security Scan (Checkov + Bandit)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install checkov bandit
+
+      - name: Checkov (IaC scan)
+        run: |
+          checkov -d terraform/ \
+            --framework terraform \
+            --hard-fail-on HIGH,MEDIUM \
+            --soft-fail-on LOW
+
+      - name: Bandit (Python security)
+        run: |
+          bandit -r glue/ lambda/ airflow/ \
+            -ll --format json -o bandit-report.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  # ── PR: Python linting ─────────────────────────────────────────────────
+  lint:
+    name: Python Lint & Type Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install ruff mypy boto3-stubs
+
+      - name: Ruff lint
+        run: ruff check glue/ lambda/ airflow/
+
+      - name: Ruff format check
+        run: ruff format --check glue/ lambda/ airflow/
+
+  # ── Deploy (main only) ─────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [terraform-plan, security, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Sync Glue scripts to S3
+        run: |
+          aws s3 sync glue/jobs/ \
+            s3://${{ secrets.SCRIPTS_BUCKET }}/glue/ \
+            --exclude "*.pyc" --delete
+
+      - name: Package & deploy Lambda (ingestion)
+        run: |
+          cd lambda/ingestion
+          pip install aiohttp awswrangler -t package/
+          cd package && zip -r ../function.zip .
+          cd .. && zip -g function.zip handler.py
+          aws lambda update-function-code \
+            --function-name weather-ingestion \
+            --zip-file fileb://function.zip
