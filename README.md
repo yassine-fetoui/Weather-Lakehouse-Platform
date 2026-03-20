@@ -697,8 +697,8 @@ weather-lakehouse-platform/
 
 <div align="center">
 
-Built by [Yassine](https://github.com/YOUR_USERNAME) · Senior Data Engineer · Paris
+Built by [Yassine](https://github.com/YOUR_USERNAME) ·  Data Engineer
 
-*Research: MMET Transformer Architecture for Atrial Fibrillation Detection — ESANN 2026*
+
 
 </div>
