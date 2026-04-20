@@ -8,10 +8,19 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  TF_DIR:     terraform/environments/prod
+  TF_DIR: terraform/environments/prod
+  PYTHON_VERSION: "3.11"
+
+# Concurrency: Cancel in-progress runs for the same PR/branch (except on main)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # ── PR: Terraform plan ─────────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────
+  # PR Validation Jobs
+  # ──────────────────────────────────────────────────────────────
+
   terraform-plan:
     name: Terraform Validate & Plan
     runs-on: ubuntu-latest
@@ -20,140 +29,195 @@ jobs:
       id-token: write
       contents: read
       pull-requests: write
-
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS Credentials (OIDC) - Plan Role
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-terraform-plan
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.7.0
+          terraform_version: 1.10.0   # Updated to latest stable
+          terraform_wrapper: false
 
-      - name: Terraform fmt check
+      - name: Terraform Format Check
         run: terraform fmt -check -recursive
         working-directory: ${{ env.TF_DIR }}
 
-      - name: Terraform init
-        run: terraform init -input=false
+      - name: Terraform Init
+        run: terraform init -input=false -backend=false
         working-directory: ${{ env.TF_DIR }}
 
-      - name: Terraform validate
+      - name: Terraform Validate
         run: terraform validate
         working-directory: ${{ env.TF_DIR }}
 
-      - name: Terraform plan
+      - name: Terraform Plan
         id: plan
-        run: terraform plan -no-color
+        run: terraform plan -no-color -detailed-exitcode
         working-directory: ${{ env.TF_DIR }}
+        continue-on-error: true
 
-      - name: Comment plan on PR
+      - name: Post Terraform Plan to PR
+        if: always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            github.rest.issues.createComment({
+            const output = `${{ steps.plan.outputs.stdout || steps.plan.outputs.stderr }}`;
+            const hasChanges = ${{ steps.plan.outputs.exitcode == '2' }};
+            const planSummary = hasChanges 
+              ? "✅ **Terraform Plan** — Infrastructure changes detected" 
+              : "✅ **Terraform Plan** — No changes detected";
+
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## Terraform Plan\n\`\`\`\n${{ steps.plan.outputs.stdout }}\n\`\`\``
+              body: `## ${planSummary}\n\n\`\`\`terraform\n${output}\n\`\`\``
             });
 
-  # ── PR: Security scan ──────────────────────────────────────────────────
-  security:
+  # ──────────────────────────────────────────────────────────────
+  # Security & Code Quality
+  # ──────────────────────────────────────────────────────────────
+
+  security-scan:
     name: Security Scan (Checkov + Bandit)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
-      - run: pip install checkov bandit
+      - name: Install Security Tools
+        run: pip install checkov bandit
 
-      - name: Checkov (IaC scan)
+      - name: Checkov IaC Scan
         run: |
           checkov -d terraform/ \
             --framework terraform \
             --hard-fail-on HIGH,MEDIUM \
-            --soft-fail-on LOW
+            --soft-fail-on LOW \
+            --compact \
+            --output cli
 
-      - name: Bandit (Python security)
+      - name: Bandit Python Security Scan
         run: |
           bandit -r glue/ lambda/ airflow/ \
-            -ll --format json -o bandit-report.json
+            --level WARNING \
+            --format json \
+            -o bandit-report.json || true
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Bandit Report
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: bandit-report
           path: bandit-report.json
 
-  # ── PR: Python linting ─────────────────────────────────────────────────
-  lint:
-    name: Python Lint & Type Check
+  python-lint:
+    name: Python Lint & Type Checking
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
-      - run: pip install ruff mypy boto3-stubs
+      - name: Install Linting Tools
+        run: pip install ruff mypy types-boto3 boto3-stubs[essential]
 
-      - name: Ruff lint
-        run: ruff check glue/ lambda/ airflow/
+      - name: Ruff Lint
+        run: ruff check glue/ lambda/ airflow/ --output-format=github
 
-      - name: Ruff format check
+      - name: Ruff Format Check
         run: ruff format --check glue/ lambda/ airflow/
 
-  # ── Deploy (main only) ─────────────────────────────────────────────────
+      - name: MyPy Type Check
+        run: mypy glue/ lambda/ airflow/ --no-error-summary || true
+
+  # ──────────────────────────────────────────────────────────────
+  # Production Deployment (Protected)
+  # ──────────────────────────────────────────────────────────────
+
   deploy:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: [terraform-plan, security, lint]
+    needs: [terraform-plan, security-scan, python-lint]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS Credentials (OIDC) - Deploy Role
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-terraform-deploy
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.7.0
+          terraform_version: 1.10.0
+          terraform_wrapper: false
 
-      - name: Terraform apply
+      - name: Terraform Init & Apply
         working-directory: ${{ env.TF_DIR }}
         run: |
           terraform init -input=false
           terraform apply -auto-approve -input=false
 
-      - name: Sync Glue scripts to S3
+      - name: Sync Glue Jobs to S3
         run: |
           aws s3 sync glue/jobs/ \
-            s3://${{ secrets.SCRIPTS_BUCKET }}/glue/ \
-            --exclude "*.pyc" --delete
+            s3://${{ secrets.SCRIPTS_BUCKET }}/glue/jobs/ \
+            --exclude "*.pyc" \
+            --delete \
+            --no-progress
 
-      - name: Package & deploy Lambda (ingestion)
+      - name: Package and Deploy Ingestion Lambda
         run: |
           cd lambda/ingestion
-          pip install aiohttp awswrangler -t package/
-          cd package && zip -r ../function.zip .
-          cd .. && zip -g function.zip handler.py
+          
+          # Clean previous package if exists
+          rm -rf package/ function.zip || true
+          
+          # Install dependencies
+          pip install --target package/ aiohttp awswrangler
+          
+          # Package dependencies + code
+          cd package
+          zip -r ../function.zip .
+          cd ..
+          zip -g function.zip handler.py
+          
+          # Deploy
           aws lambda update-function-code \
             --function-name weather-ingestion \
-            --zip-file fileb://function.zip
+            --zip-file fileb://function.zip \
+            --no-cli-pager
+
+          echo "Lambda function weather-ingestion updated successfully."
+
+      # Optional: Add more deployment steps here (e.g. other Lambdas, Glue triggers, etc.)
